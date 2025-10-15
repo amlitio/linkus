@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureLink Share | Instant Session Sharing</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        /* Style for the shared content textarea to look like a screen */
+        #sharedContent, #viewerScreen {
+            min-height: 200px;
+            font-size: 14px;
+            line-height: 1.5;
+            letter-spacing: 0.5px;
+            white-space: pre-wrap;
+            overflow-y: auto;
+            resize: none;
+        }
+        .code-input {
+            letter-spacing: 0.75rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen p-4 sm:p-8 flex items-center justify-center">
+
+    <div id="app" class="w-full max-w-lg bg-gray-800 p-6 sm:p-8 rounded-xl shadow-2xl border border-gray-700">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-extrabold text-indigo-400">SecureLink Share</h1>
+            <p class="mt-2 text-gray-400">Instant, encrypted session sharing using a unique code.</p>
+        </header>
+
+        <!-- Dynamic Content Area -->
+        <div id="content">
+            <!-- Content will be injected here by JavaScript -->
+        </div>
+
+        <!-- Alert/Message Box -->
+        <div id="messageBox" class="mt-6 hidden bg-red-600/20 text-red-300 p-3 rounded-lg border border-red-500/50 transition-all duration-300" role="alert">
+            <!-- Message will be displayed here -->
+        </div>
+    </div>
+
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, getDoc, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global Firebase variables are assumed to be defined by the execution environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth;
+        let currentUserId = null;
+        let currentSessionCode = null;
+        let sharerUnsubscribe = null; // Listener for Firestore snapshot
+        let viewerUnsubscribe = null; // Listener for Firestore snapshot
+
+        // --- Utility Functions ---
+
+        /** Shows a temporary message in the message box */
+        function showMessage(msg, isError = false) {
+            const box = document.getElementById('messageBox');
+            box.textContent = msg;
+            box.className = `mt-6 block p-3 rounded-lg border transition-all duration-300 ${
+                isError ? 'bg-red-600/20 text-red-300 border-red-500/50' : 'bg-green-600/20 text-green-300 border-green-500/50'
+            }`;
+            box.style.display = 'block';
+            setTimeout(() => {
+                box.style.display = 'none';
+            }, 5000);
+        }
+
+        /** Generates a random 6-character uppercase alphanumeric code */
+        function generateRandomCode() {
+            return Math.random().toString(36).substring(2, 8).toUpperCase();
+        }
+
+        /** Returns the Firestore document path for a session */
+        function getSessionDocRef(code) {
+            return doc(db, `artifacts/${appId}/public/data/sessions`, code);
+        }
+
+        // --- Render Functions (UI Management) ---
+
+        function setLoading(isLoading, text = 'Loading...') {
+            const content = document.getElementById('content');
+            if (isLoading) {
+                content.innerHTML = `
+                    <div class="flex flex-col items-center justify-center p-12">
+                        <svg class="animate-spin h-8 w-8 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <p class="mt-4 text-gray-300">${text}</p>
+                    </div>
+                `;
+            }
+        }
+
+        function renderHome() {
+            if (!currentUserId) {
+                setLoading(true, 'Connecting to secure service...');
+                return;
+            }
+
+            const content = document.getElementById('content');
+            content.innerHTML = `
+                <p class="text-center text-gray-400 mb-6">User ID: <span class="font-mono text-xs bg-gray-700 p-1 rounded">${currentUserId}</span></p>
+                <h2 class="text-2xl font-semibold mb-4 text-center text-gray-200">What would you like to do?</h2>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- Share Screen Card -->
+                    <div class="bg-gray-700 p-5 rounded-xl shadow-lg hover:shadow-indigo-500/30 transition duration-300">
+                        <h3 class="text-xl font-bold text-indigo-300 mb-2">1. Share My Screen</h3>
+                        <p class="text-gray-400 text-sm mb-4">Generate a secure, unique code for a viewer to join.</p>
+                        <button id="btnGenerate" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 rounded-lg transition duration-200 shadow-md shadow-indigo-500/20">
+                            Generate Code
+                        </button>
+                    </div>
+
+                    <!-- Join Session Card -->
+                    <div class="bg-gray-700 p-5 rounded-xl shadow-lg hover:shadow-emerald-500/30 transition duration-300">
+                        <h3 class="text-xl font-bold text-emerald-300 mb-2">2. Join a Session</h3>
+                        <p class="text-gray-400 text-sm mb-4">Input a 6-character code to view a shared session.</p>
+                        <button id="btnJoin" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2 rounded-lg transition duration-200 shadow-md shadow-emerald-500/20">
+                            Join Session
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            document.getElementById('btnGenerate').addEventListener('click', generateSessionCode);
+            document.getElementById('btnJoin').addEventListener('click', renderJoinPrompt);
+        }
+
+        function renderJoinPrompt() {
+            const content = document.getElementById('content');
+            content.innerHTML = `
+                <h2 class="text-2xl font-semibold mb-4 text-center text-gray-200">Enter Session Code</h2>
+                <input id="codeInput" type="text" maxlength="6" placeholder="______" class="code-input w-full bg-gray-700 text-gray-100 placeholder-gray-500 p-3 rounded-lg border border-gray-600 focus:ring-indigo-500 focus:border-indigo-500 uppercase text-3xl font-mono tracking-widest text-center" />
+                <div class="mt-6 flex flex-col space-y-3">
+                    <button id="btnConnect" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-lg transition duration-200">
+                        Connect to Session
+                    </button>
+                    <button onclick="renderHome()" class="w-full text-gray-400 hover:text-gray-200 py-2 rounded-lg">
+                        Go Back
+                    </button>
+                </div>
+            `;
+            document.getElementById('btnConnect').addEventListener('click', attemptToJoinSession);
+        }
+
+        function renderSharerMode(code, sessionData) {
+            const content = document.getElementById('content');
+            const statusColor = sessionData.status === 'active' ? 'text-green-400' : 'text-yellow-400';
+            const statusText = sessionData.status === 'active' ? 'Active & Sharing' : 'Awaiting Connection';
+            
+            content.innerHTML = `
+                <div class="text-center mb-6">
+                    <h2 class="text-2xl font-semibold text-gray-200">Your Share Code:</h2>
+                    <p class="text-6xl font-extrabold text-indigo-400 my-4 tracking-wider">${code}</p>
+                    <p class="text-sm font-medium ${statusColor}">Status: ${statusText}</p>
+                    <p class="text-xs text-gray-500 mt-2">Viewer ID: <span class="font-mono">${sessionData.viewerId || 'N/A'}</span></p>
+                </div>
+
+                <div class="mt-6 p-4 bg-gray-700 rounded-lg">
+                    <label for="sharedContent" class="block text-gray-300 font-semibold mb-2">Live Content Snapshot (Simulated Screen)</label>
+                    <textarea id="sharedContent" placeholder="Type what you want to share. It updates in real-time."
+                              class="w-full bg-gray-800 text-gray-100 p-3 rounded-lg border border-gray-600 focus:ring-indigo-500 focus:border-indigo-500"
+                              oninput="updateSharedContent(this.value)">${sessionData.sharedContent || ''}</textarea>
+                </div>
+
+                <div class="mt-6 flex space-x-3">
+                    <button id="btnCloseSession" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-semibold py-3 rounded-lg transition duration-200">
+                        Close Session
+                    </button>
+                    ${sessionData.status !== 'active' && sessionData.viewerId ? `
+                        <button id="btnAccept" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-lg transition duration-200">
+                            Accept Connection
+                        </button>
+                    ` : ''}
+                </div>
+            `;
+
+            document.getElementById('btnCloseSession').addEventListener('click', closeSession);
+            if (sessionData.status !== 'active' && sessionData.viewerId) {
+                document.getElementById('btnAccept').addEventListener('click', acceptViewer);
+            }
+        }
+
+        function renderViewerMode(code, sessionData) {
+            const content = document.getElementById('content');
+            const statusColor = sessionData.status === 'active' ? 'text-green-400' : 'text-yellow-400';
+            const statusText = sessionData.status === 'active' ? 'Active' : 'Awaiting Sharer Approval';
+
+            content.innerHTML = `
+                <div class="text-center mb-6">
+                    <h2 class="text-2xl font-semibold text-gray-200">Viewing Session:</h2>
+                    <p class="text-5xl font-extrabold text-emerald-400 my-4 tracking-wider">${code}</p>
+                    <p class="text-sm font-medium ${statusColor}">Status: ${statusText}</p>
+                    <p class="text-xs text-gray-500 mt-2">Sharer ID: <span class="font-mono">${sessionData.sharerId}</span></p>
+                </div>
+
+                <div class="mt-6 p-4 bg-gray-700 rounded-lg">
+                    <label for="viewerScreen" class="block text-gray-300 font-semibold mb-2">Live Shared Content</label>
+                    <pre id="viewerScreen"
+                          class="w-full bg-gray-900 text-gray-100 p-3 rounded-lg border border-gray-600 select-all">${sessionData.sharedContent || 'Waiting for shared content...'}</pre>
+                </div>
+
+                <div class="mt-6">
+                    <button id="btnDisconnect" class="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-3 rounded-lg transition duration-200">
+                        Disconnect
+                    </button>
+                </div>
+            `;
+
+            document.getElementById('btnDisconnect').addEventListener('click', disconnectViewer);
+
+            // Hide shared content textarea if status is not active
+            const viewerScreen = document.getElementById('viewerScreen');
+            if (sessionData.status !== 'active') {
+                viewerScreen.textContent = "Connection established, but waiting for the sharer to approve and start sharing...";
+                viewerScreen.style.opacity = 0.5;
+            } else {
+                viewerScreen.style.opacity = 1;
+            }
+        }
+
+        // --- Sharer Logic ---
+
+        async function generateSessionCode() {
+            setLoading(true, 'Generating secure code...');
+            const code = generateRandomCode();
+            currentSessionCode = code;
+            const sessionRef = getSessionDocRef(code);
+
+            try {
+                // Check if code already exists (unlikely but possible)
+                const docSnap = await getDoc(sessionRef);
+                if (docSnap.exists()) {
+                    // Try again if code already exists
+                    return generateSessionCode();
+                }
+
+                // Create a new session document
+                await setDoc(sessionRef, {
+                    sharerId: currentUserId,
+                    status: 'waiting_for_viewer',
+                    sharedContent: 'Welcome to my shared screen session. Waiting for a viewer to connect...',
+                    viewerId: null
+                });
+
+                showMessage(`Code generated: ${code}`, false);
+                // Start listening for changes (e.g., a viewer joining)
+                startSharerListener();
+            } catch (error) {
+                console.error("Error generating session:", error);
+                showMessage("Failed to generate code. See console for details.", true);
+                renderHome(); // Go back to home on error
+            }
+        }
+
+        function startSharerListener() {
+            if (sharerUnsubscribe) sharerUnsubscribe(); // Cleanup old listener
+            const sessionRef = getSessionDocRef(currentSessionCode);
+
+            sharerUnsubscribe = onSnapshot(sessionRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    if (data.status === 'closed') {
+                        closeSessionLocally();
+                        showMessage("Session was closed by Sharer or Viewer disconnected.", true);
+                        return;
+                    }
+                    renderSharerMode(currentSessionCode, data);
+                } else {
+                    closeSessionLocally();
+                    showMessage("Session document deleted. Going back to home.", true);
+                }
+            }, (error) => {
+                console.error("Sharer listener error:", error);
+                closeSessionLocally();
+                showMessage("Real-time connection lost.", true);
+            });
+        }
+
+        /** Accepts a waiting viewer's connection */
+        async function acceptViewer() {
+            if (!currentSessionCode) return;
+            const sessionRef = getSessionDocRef(currentSessionCode);
+
+            try {
+                await setDoc(sessionRef, { status: 'active' }, { merge: true });
+                showMessage("Connection accepted! Sharing has started.", false);
+            } catch (error) {
+                console.error("Error accepting viewer:", error);
+                showMessage("Failed to accept connection. Try again.", true);
+            }
+        }
+
+        /** Real-time update of the shared content text */
+        let updateTimeout;
+        window.updateSharedContent = function(content) {
+            clearTimeout(updateTimeout);
+            updateTimeout = setTimeout(async () => {
+                if (!currentSessionCode) return;
+                const sessionRef = getSessionDocRef(currentSessionCode);
+                try {
+                    await setDoc(sessionRef, { sharedContent: content }, { merge: true });
+                } catch (error) {
+                    console.error("Error updating content:", error);
+                }
+            }, 300); // Debounce updates
+        }
+
+        /** Removes listener and returns to home */
+        function closeSessionLocally() {
+            if (sharerUnsubscribe) sharerUnsubscribe();
+            sharerUnsubscribe = null;
+            currentSessionCode = null;
+            renderHome();
+        }
+
+        /** Closes the session and deletes the document */
+        async function closeSession() {
+            if (!currentSessionCode) {
+                closeSessionLocally();
+                return;
+            }
+            const sessionRef = getSessionDocRef(currentSessionCode);
+            try {
+                // Set status to closed so Viewer listener gets the update before Sharer deletes it
+                await setDoc(sessionRef, { status: 'closed' }, { merge: true });
+                // Delete the document after a small delay
+                setTimeout(async () => {
+                    await setDoc(sessionRef, { status: 'closed' }, { merge: true }); // A safe delete alternative
+                    closeSessionLocally();
+                    showMessage("Session successfully closed.", false);
+                }, 500);
+            } catch (error) {
+                console.error("Error closing session:", error);
+                showMessage("Failed to close session. See console.", true);
+            }
+        }
+
+
+        // --- Viewer Logic ---
+
+        async function attemptToJoinSession() {
+            const input = document.getElementById('codeInput');
+            const code = input.value.toUpperCase().trim();
+            if (code.length !== 6) {
+                showMessage("Code must be 6 characters.", true);
+                return;
+            }
+            setLoading(true, 'Connecting to session...');
+            currentSessionCode = code;
+            const sessionRef = getSessionDocRef(code);
+
+            try {
+                // Use a transaction to ensure atomic update of viewerId
+                await runTransaction(db, async (transaction) => {
+                    const sessionDoc = await transaction.get(sessionRef);
+
+                    if (!sessionDoc.exists()) {
+                        throw "Session not found.";
+                    }
+
+                    const data = sessionDoc.data();
+
+                    if (data.sharerId === currentUserId) {
+                        throw "Cannot join your own session.";
+                    }
+                    if (data.viewerId && data.viewerId !== currentUserId) {
+                        throw "Session already has a viewer.";
+                    }
+                    if (data.status === 'closed') {
+                        throw "Session is closed.";
+                    }
+
+                    // Request to join: Set viewerId and keep status as 'waiting_for_viewer'
+                    transaction.update(sessionRef, {
+                        viewerId: currentUserId,
+                    });
+                });
+
+                showMessage(`Successfully requested to join session ${code}. Waiting for sharer approval.`, false);
+                startViewerListener();
+
+            } catch (error) {
+                console.error("Error joining session:", error);
+                showMessage(typeof error === 'string' ? error : "Failed to join session. Check console.", true);
+                currentSessionCode = null;
+                renderHome();
+            }
+        }
+
+        function startViewerListener() {
+            if (viewerUnsubscribe) viewerUnsubscribe(); // Cleanup old listener
+            const sessionRef = getSessionDocRef(currentSessionCode);
+
+            viewerUnsubscribe = onSnapshot(sessionRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    if (data.status === 'closed' || data.viewerId !== currentUserId) {
+                        disconnectViewerLocally();
+                        showMessage("The sharer ended the session or you were disconnected.", true);
+                        return;
+                    }
+                    renderViewerMode(currentSessionCode, data);
+                } else {
+                    disconnectViewerLocally();
+                    showMessage("Session document deleted. Disconnected.", true);
+                }
+            }, (error) => {
+                console.error("Viewer listener error:", error);
+                disconnectViewerLocally();
+                showMessage("Real-time connection lost.", true);
+            });
+        }
+
+        /** Disconnects the viewer and updates Firestore to nullify viewerId */
+        async function disconnectViewer() {
+            if (!currentSessionCode) {
+                disconnectViewerLocally();
+                return;
+            }
+            const sessionRef = getSessionDocRef(currentSessionCode);
+            try {
+                // Attempt to update the viewerId to null
+                await setDoc(sessionRef, { viewerId: null, status: 'waiting_for_viewer' }, { merge: true });
+                disconnectViewerLocally();
+                showMessage("Successfully disconnected.", false);
+            } catch (error) {
+                console.error("Error disconnecting:", error);
+                // If update fails, still disconnect locally
+                disconnectViewerLocally();
+                showMessage("Disconnected locally, but could not notify sharer.", true);
+            }
+        }
+
+        /** Removes listener and returns to home for the viewer */
+        function disconnectViewerLocally() {
+            if (viewerUnsubscribe) viewerUnsubscribe();
+            viewerUnsubscribe = null;
+            currentSessionCode = null;
+            renderHome();
+        }
+
+        // --- Initialization ---
+
+        async function initFirebase() {
+            if (!firebaseConfig) {
+                showMessage("Firebase config missing. Cannot run app.", true);
+                return;
+            }
+            
+            // Set debug log level for better console visibility
+            setLogLevel('debug');
+            
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // 1. Authenticate the user
+            await new Promise(resolve => {
+                const unsubscribe = onAuthStateChanged(auth, async (user) => {
+                    if (!user) {
+                        // Attempt to sign in with custom token or anonymously
+                        if (initialAuthToken) {
+                            try {
+                                const credentials = await signInWithCustomToken(auth, initialAuthToken);
+                                currentUserId = credentials.user.uid;
+                            } catch (error) {
+                                console.error("Custom token sign-in failed:", error);
+                                await signInAnonymously(auth);
+                            }
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } else {
+                        currentUserId = user.uid;
+                    }
+                    unsubscribe();
+                    resolve();
+                });
+            });
+
+            // 2. Render the application home state
+            renderHome();
+        }
+
+        // Initialize the app on window load
+        window.onload = initFirebase;
+
+    </script>
+</body>
+</html>
+
