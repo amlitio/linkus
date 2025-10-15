@@ -39,7 +39,14 @@
 
         <!-- Dynamic Content Area -->
         <div id="content">
-            <!-- Content will be injected here by JavaScript -->
+            <!-- Initial Loading State -->
+            <div class="flex flex-col items-center justify-center p-12">
+                <svg class="animate-spin h-8 w-8 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <p class="mt-4 text-gray-300">Connecting to Firebase services...</p>
+            </div>
         </div>
 
         <!-- Alert/Message Box -->
@@ -55,11 +62,7 @@
         import { getFirestore, doc, setDoc, onSnapshot, collection, getDoc, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Global Firebase variables are assumed to be defined by the execution environment
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
+        // Global variables for Firebase instances
         let db, auth;
         let currentUserId = null;
         let currentSessionCode = null;
@@ -76,9 +79,12 @@
                 isError ? 'bg-red-600/20 text-red-300 border-red-500/50' : 'bg-green-600/20 text-green-300 border-green-500/50'
             }`;
             box.style.display = 'block';
-            setTimeout(() => {
-                box.style.display = 'none';
-            }, 5000);
+            // Do not hide persistent error messages immediately
+            if (!isError) {
+                setTimeout(() => {
+                    box.style.display = 'none';
+                }, 5000);
+            }
         }
 
         /** Generates a random 6-character uppercase alphanumeric code */
@@ -88,6 +94,13 @@
 
         /** Returns the Firestore document path for a session */
         function getSessionDocRef(code) {
+            // Check if db is initialized before trying to use it
+            if (!db) {
+                console.error("Firestore database instance not initialized.");
+                return null;
+            }
+            // These global variables are expected to be injected by the environment
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
             return doc(db, `artifacts/${appId}/public/data/sessions`, code);
         }
 
@@ -245,6 +258,12 @@
             currentSessionCode = code;
             const sessionRef = getSessionDocRef(code);
 
+            if (!sessionRef) {
+                showMessage("Database not initialized. Cannot generate code.", true);
+                renderHome();
+                return;
+            }
+
             try {
                 // Check if code already exists (unlikely but possible)
                 const docSnap = await getDoc(sessionRef);
@@ -339,15 +358,14 @@
                 return;
             }
             const sessionRef = getSessionDocRef(currentSessionCode);
+            if (!sessionRef) return;
+            
             try {
-                // Set status to closed so Viewer listener gets the update before Sharer deletes it
+                // Set status to closed so Viewer listener gets the update before Sharer stops listening
                 await setDoc(sessionRef, { status: 'closed' }, { merge: true });
-                // Delete the document after a small delay
-                setTimeout(async () => {
-                    await setDoc(sessionRef, { status: 'closed' }, { merge: true }); // A safe delete alternative
-                    closeSessionLocally();
-                    showMessage("Session successfully closed.", false);
-                }, 500);
+                // Note: We don't delete the document fully; we just set 'closed' status for safety.
+                closeSessionLocally();
+                showMessage("Session successfully closed.", false);
             } catch (error) {
                 console.error("Error closing session:", error);
                 showMessage("Failed to close session. See console.", true);
@@ -367,6 +385,12 @@
             setLoading(true, 'Connecting to session...');
             currentSessionCode = code;
             const sessionRef = getSessionDocRef(code);
+
+            if (!sessionRef) {
+                showMessage("Database not initialized. Cannot join session.", true);
+                renderHome();
+                return;
+            }
 
             try {
                 // Use a transaction to ensure atomic update of viewerId
@@ -437,6 +461,8 @@
                 return;
             }
             const sessionRef = getSessionDocRef(currentSessionCode);
+            if (!sessionRef) return;
+            
             try {
                 // Attempt to update the viewerId to null
                 await setDoc(sessionRef, { viewerId: null, status: 'waiting_for_viewer' }, { merge: true });
@@ -461,29 +487,63 @@
         // --- Initialization ---
 
         async function initFirebase() {
-            if (!firebaseConfig) {
-                showMessage("Firebase config missing. Cannot run app.", true);
+            let config = null;
+            let authToken = null;
+
+            // 1. Try to load and parse environment variables safely
+            try {
+                if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                    config = JSON.parse(__firebase_config);
+                }
+                authToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+            } catch (e) {
+                console.error("Configuration Parsing Error:", e);
+                document.getElementById('content').innerHTML = `
+                    <p class="text-xl font-semibold text-red-400 mt-4">DEPENDENCY ERROR: Configuration Invalid</p>
+                    <p class="text-gray-400 mt-2">The Firebase configuration variable provided by the environment is malformed (not valid JSON).</p>
+                    <p class="text-xs text-gray-500 mt-4">Please check the console for details.</p>
+                `;
+                return;
+            }
+
+            if (!config) {
+                document.getElementById('content').innerHTML = `
+                    <p class="text-xl font-semibold text-red-400 mt-4">DEPENDENCY ERROR: Firebase Config Missing</p>
+                    <p class="text-gray-400 mt-2">The required <code>__firebase_config</code> is missing from the environment. This application cannot run without it.</p>
+                    <p class="text-xs text-gray-500 mt-4">Please ensure the deployment environment provides the configuration.</p>
+                `;
                 return;
             }
             
             // Set debug log level for better console visibility
             setLogLevel('debug');
-            
-            const app = initializeApp(firebaseConfig);
-            db = getFirestore(app);
-            auth = getAuth(app);
 
-            // 1. Authenticate the user
+            try {
+                // 2. Initialize Firebase services
+                const app = initializeApp(config);
+                db = getFirestore(app);
+                auth = getAuth(app);
+            } catch (e) {
+                console.error("Firebase Initialization Failed:", e);
+                document.getElementById('content').innerHTML = `
+                    <p class="text-xl font-semibold text-red-400 mt-4">FIREBASE INIT FAILED</p>
+                    <p class="text-gray-400 mt-2">Firebase failed to start. This is usually due to an incorrect configuration key or project ID.</p>
+                    <p class="text-xs text-gray-500 mt-4">Please check the console for the Firebase SDK error trace.</p>
+                `;
+                return; // Stop execution if initialization fails
+            }
+
+            // 3. Authenticate the user
             await new Promise(resolve => {
                 const unsubscribe = onAuthStateChanged(auth, async (user) => {
                     if (!user) {
                         // Attempt to sign in with custom token or anonymously
-                        if (initialAuthToken) {
+                        if (authToken) {
                             try {
-                                const credentials = await signInWithCustomToken(auth, initialAuthToken);
+                                const credentials = await signInWithCustomToken(auth, authToken);
                                 currentUserId = credentials.user.uid;
                             } catch (error) {
-                                console.error("Custom token sign-in failed:", error);
+                                console.error("Custom token sign-in failed. Attempting anonymous sign-in:", error);
                                 await signInAnonymously(auth);
                             }
                         } else {
@@ -497,7 +557,7 @@
                 });
             });
 
-            // 2. Render the application home state
+            // 4. Render the application home state
             renderHome();
         }
 
@@ -507,4 +567,5 @@
     </script>
 </body>
 </html>
+
 
